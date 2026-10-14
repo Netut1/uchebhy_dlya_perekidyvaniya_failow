@@ -1,0 +1,20 @@
+Get-ChildItem -Path "C:\Users\rdani\IdeaProjects\sudustrial\26.2\src" -Recurse -File | 
+Where-Object { 
+    $_.FullName -notmatch '[\\/](\.git|\.github|\.gradle|\.idea|build|gradle|run)[\\/]' -and 
+    $_.Extension -notmatch '(?i)\.(png|jpg|jpeg|gif|ico|jar|exe|dll|class|zip|gz)$' 
+} | 
+ForEach-Object { 
+    "=================================================="
+    "FILE: $($_.FullName)"
+    "=================================================="
+    Get-Content $_.FullName -ErrorAction SilentlyContinue
+    "`n" 
+} | Out-File -FilePath "C:\Users\rdani\OneDrive\Документы\sudustrial\дамп.txt" -Encoding utf8
+
+
+
+
+
+
+
+tree "C:\Users\rdani\IdeaProjects\sudustrial\26.2\src" /F /A > "C:\Users\rdani\OneDrive\Документы\sudustrial\дерево структуры.txt"
