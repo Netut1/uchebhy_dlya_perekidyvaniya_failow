@@ -1,0 +1,1179 @@
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\13_variant.csproj
+==================================================
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RootNamespace>_13_variant</RootNamespace>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\CallEventArgs.cs
+==================================================
+using _13_variant.Phones;
+
+namespace PhoneStationModel
+{
+    public class CallEventArgs : EventArgs
+    {
+        public Handset From { get; }
+        public Handset? To { get; }
+        public string Message { get; }
+        public DateTime Time { get; } = DateTime.Now;
+
+        public CallEventArgs(Handset from, Handset? to, string message)
+        {
+            From = from;
+            To = to;
+            Message = message;
+        }
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\Program.cs
+==================================================
+using PhoneStationModel;
+
+namespace PhoneStationModel
+{
+    internal static class Program
+    {
+        [STAThread]
+        private static void Main()
+        {
+            ApplicationConfiguration.Initialize();
+            using var settingsForm = new StartupSettingsForm();
+            if (settingsForm.ShowDialog() != DialogResult.OK) return;
+            Application.Run(new SimulationForm(settingsForm.Settings));
+        }
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\SimulationClock.cs
+==================================================
+using System;
+
+namespace PhoneStationModel
+{
+    /// <summary>
+    /// Виртуальные часы симуляции. Идут быстрее реальных.
+    /// TimeFactor() — множитель активности в зависимости от времени суток.
+    /// </summary>
+    public class SimulationClock
+    {
+        public TimeSpan SimulatedTime { get; private set; } = TimeSpan.FromHours(8);
+
+        /// <summary>Сколько симулированных минут проходит за 1 реальную секунду.</summary>
+        public double MinutesPerSecond { get; set; } = 6.0;
+
+        public int Hour => SimulatedTime.Hours;
+        public int Minute => SimulatedTime.Minutes;
+        public string TimeString => $"{Hour:D2}:{Minute:D2}";
+        public bool IsDay => Hour >= 6 && Hour < 20;
+
+        public void Tick(int elapsedMs, double speedMultiplier = 1.0)
+        {
+            double simMin = elapsedMs / 1000.0 * MinutesPerSecond * speedMultiplier;
+            SimulatedTime = SimulatedTime.Add(TimeSpan.FromMinutes(simMin));
+            if (SimulatedTime.TotalHours >= 24)
+                SimulatedTime -= TimeSpan.FromHours(24);
+        }
+
+        /// <summary>Множитель «жизненной активности» по времени суток.</summary>
+        public double TimeFactor()
+        {
+            int h = Hour;
+            if (h >= 9 && h <= 18) return 1.5;   // рабочий день
+            if (h >= 19 && h <= 22) return 1.2;  // вечер
+            if (h >= 7 && h <= 8) return 1.0;    // утро
+            if (h >= 23 || h <= 5) return 0.3;   // ночь
+            return 0.7;                          // переходные часы
+        }
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\Calls\Call.cs
+==================================================
+using _13_variant.Phones;
+
+namespace PhoneStationModel
+{
+    public sealed class Call
+    {
+        public CallSession Session { get; } = new();
+        public CallConnection Connection { get; }
+        public Handset Caller => Connection.Caller;
+        public Handset Callee => Connection.Callee;
+
+        public Call(Handset caller, Handset callee) => Connection = new CallConnection(caller, callee);
+        public void Begin()
+        {
+            Session.Start(); Caller.RaiseOutgoingCall(Callee); Session.MarkRinging();
+            Callee.SetState(HandsetState.Ringing); Callee.RaiseIncomingCall(Caller);
+        }
+        public void Answer()
+        {
+            Connection.Establish(); Session.MarkActive();
+            Caller.SetState(HandsetState.Talking); Callee.SetState(HandsetState.Talking);
+        }
+        public void End()
+        {
+            Connection.Drop(); Session.End(); Caller.RaiseCallEnded(Callee); Callee.RaiseCallEnded(Caller);
+            if (Caller.State != HandsetState.Off) Caller.SetState(HandsetState.Idle);
+            if (Callee.State != HandsetState.Off) Callee.SetState(HandsetState.Idle);
+        }
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\Calls\CallConnection.cs
+==================================================
+using _13_variant.Phones;
+
+namespace PhoneStationModel
+{
+    public class CallConnection
+    {
+        public Handset Caller { get; }
+        public Handset Callee { get; }
+        public int SignalQuality { get; set; } = 100;
+        public bool IsEstablished { get; private set; }
+
+        public event EventHandler? Established;
+        public event EventHandler? Lost;
+
+        public CallConnection(Handset caller, Handset callee)
+        {
+            Caller = caller;
+            Callee = callee;
+        }
+
+        public void Establish()
+        {
+            if (IsEstablished) return;
+            IsEstablished = true;
+            Established?.Invoke(this, EventArgs.Empty);
+        }
+
+        public void Drop()
+        {
+            if (!IsEstablished) return;
+            IsEstablished = false;
+            Lost?.Invoke(this, EventArgs.Empty);
+        }
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\Calls\CallSession.cs
+==================================================
+namespace PhoneStationModel
+{
+    public enum SessionState { Created, Dialing, Ringing, Active, Ended, Failed }
+
+    public class CallSession
+    {
+        public Guid Id { get; } = Guid.NewGuid();
+        public SessionState State { get; private set; } = SessionState.Created;
+        public DateTime StartedAt { get; private set; }
+        public DateTime? EndedAt { get; private set; }
+        public TimeSpan Duration => (EndedAt ?? DateTime.Now) - StartedAt;
+
+        public event EventHandler<SessionState>? StateChanged;
+
+        public void Start()
+        {
+            StartedAt = DateTime.Now;
+            Transition(SessionState.Dialing);
+        }
+
+        public void MarkRinging() => Transition(SessionState.Ringing);
+        public void MarkActive() => Transition(SessionState.Active);
+        public void End()
+        {
+            EndedAt = DateTime.Now;
+            Transition(SessionState.Ended);
+        }
+
+        private void Transition(SessionState next)
+        {
+            if (State == next) return;
+            State = next;
+            StateChanged?.Invoke(this, next);
+        }
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\Phones\Handset.cs
+==================================================
+using PhoneStationModel;
+
+namespace _13_variant.Phones
+{
+    public enum HandsetState { Off, Idle, Dialing, Ringing, Talking }
+
+    public class Handset
+    {
+        private static int _nextId = 1;
+
+        public int Id { get; } = _nextId++;
+        public string Number { get; }
+        public HandsetState State { get; protected set; } = HandsetState.Off;
+        public PointF Position { get; set; }
+        public bool IsRegistered { get; internal set; }
+
+        public event EventHandler<CallEventArgs>? IncomingCall;
+        public event EventHandler<CallEventArgs>? OutgoingCall;
+        public event EventHandler<CallEventArgs>? CallEnded;
+        public event EventHandler<Handset>? StateChanged;
+
+        public Handset(string number) => Number = number;
+
+        public virtual void SetState(HandsetState newState)
+        {
+            if (State == newState) return;
+            State = newState;
+            StateChanged?.Invoke(this, this);
+        }
+
+        public virtual bool CanMakeCall() => IsRegistered && State == HandsetState.Idle;
+
+        public virtual void RaiseIncomingCall(Handset from) => IncomingCall?.Invoke(this, new CallEventArgs(from, this, "Входящий вызов"));
+        public virtual void RaiseOutgoingCall(Handset to) => OutgoingCall?.Invoke(this, new CallEventArgs(this, to, "Исходящий вызов"));
+        public virtual void RaiseCallEnded(Handset partner) => CallEnded?.Invoke(this, new CallEventArgs(this, partner, "Вызов завершён"));
+
+        public override string ToString() => $"{GetType().Name} {Number} [{State}]";
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\Phones\Phone.cs
+==================================================
+namespace _13_variant.Phones
+{
+    public class Phone : Handset
+    {
+        public string Model { get; set; }
+        public int Battery { get; protected set; }
+
+        public Phone(string number, string model, int battery = 100) : base(number)
+        {
+            Model = model;
+            Battery = battery;
+        }
+
+        public virtual void ConsumeBattery(int amount = 1)
+        {
+            Battery = Math.Max(0, Battery - amount);
+            if (Battery == 0) SetState(HandsetState.Off);
+        }
+
+        public override bool CanMakeCall() => base.CanMakeCall() && Battery > 0;
+        public override string ToString() => $"{base.ToString()} | {Model} | {Battery}%";
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\Phones\WiredHandset.cs
+==================================================
+using _13_variant.Phones;
+
+namespace PhoneStationModel
+{
+    public enum HookState { OnHook, OffHook }
+
+    /// <summary>Квадратный абонентский аппарат с трубкой и рычагом.</summary>
+    public class WiredHandset : Handset
+    {
+        public string Location { get; }
+        public HookState Hook { get; private set; } = HookState.OnHook;
+        public bool HasMechanicalBell { get; set; } = true;
+        public event EventHandler<Handset>? BellRang;
+        public event EventHandler<HookState>? HookChanged;
+
+        public WiredHandset(string number, string location) : base(number) => Location = location;
+        public void LiftHook()
+        {
+            if (Hook == HookState.OffHook) return;
+            Hook = HookState.OffHook; HookChanged?.Invoke(this, Hook);
+        }
+        public void PutHook()
+        {
+            if (Hook == HookState.OnHook) return;
+            Hook = HookState.OnHook; HookChanged?.Invoke(this, Hook);
+            if (State is HandsetState.Talking or HandsetState.Dialing or HandsetState.Ringing) SetState(HandsetState.Idle);
+        }
+        public override bool CanMakeCall() => base.CanMakeCall() && Hook == HookState.OffHook;
+        public override void RaiseIncomingCall(Handset from)
+        {
+            if (HasMechanicalBell) BellRang?.Invoke(this, this);
+            base.RaiseIncomingCall(from);
+        }
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\Station\BaseStation.cs
+==================================================
+using _13_variant.Phones;
+
+namespace PhoneStationModel
+{
+    public class BaseStation
+    {
+        public RegistrationService Registration { get; } = new();
+        public CallRouter Router { get; }
+
+        public BaseStation() => Router = new CallRouter(Registration);
+
+        public void Register(Handset h) => Registration.Register(h);
+        public void Unregister(Handset h) => Registration.Unregister(h);
+        public Call? Call(Handset from, string number) => Router.Route(from, number);
+        public void Answer(Handset h) => Router.AnswerCall(h);
+        public void HangUp(Handset h) => Router.EndCall(h);
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\Station\CallRouter.cs
+==================================================
+using _13_variant.Phones;
+
+namespace PhoneStationModel
+{
+    /// <summary>Маршрутизатор обычных абонентских вызовов. Межгорода в этой модели нет.</summary>
+    public sealed class CallRouter
+    {
+        private readonly RegistrationService _registry;
+        private readonly Dictionary<Handset, Call> _active = new();
+        private readonly List<Call> _history = new();
+        public event EventHandler<Call>? CallStarted;
+        public event EventHandler<Call>? CallCompleted;
+        public event EventHandler<CallEventArgs>? CallFailed;
+
+        public CallRouter(RegistrationService registry) => _registry = registry;
+        public IReadOnlyList<Call> ActiveCalls => _active.Values.Distinct().ToList();
+        public Call? FindCallFor(Handset h) => _active.TryGetValue(h, out var call) ? call : null;
+
+        public Call? Route(Handset from, string targetNumber)
+        {
+            if (!_registry.IsRegistered(from) || !from.CanMakeCall())
+            {
+                Fail(from, null, "Вызывающий абонент не зарегистрирован или не готов к звонку.");
+                return null;
+            }
+            var to = _registry.Find(targetNumber);
+            if (to == null) { Fail(from, null, $"Абонент {targetNumber} не найден."); return null; }
+            if (ReferenceEquals(from, to)) { Fail(from, to, "Нельзя позвонить самому себе."); return null; }
+            if (_active.ContainsKey(from) || _active.ContainsKey(to) || to.State != HandsetState.Idle)
+            {
+                Fail(from, to, "Один из абонентов уже занят.");
+                return null;
+            }
+
+            var call = new Call(from, to);
+            _active[from] = call; _active[to] = call; _history.Add(call);
+            from.SetState(HandsetState.Dialing);
+            call.Begin();
+            CallStarted?.Invoke(this, call);
+            return call;
+        }
+
+        public void AnswerCall(Handset who)
+        {
+            if (_active.TryGetValue(who, out var call) && !call.Connection.IsEstablished) call.Answer();
+        }
+        public void EndCall(Handset who) { if (_active.TryGetValue(who, out var call)) AbortCall(call); }
+
+        public bool AbortCall(Call call)
+        {
+            if (!_active.ContainsKey(call.Caller)) return false;
+            _active.Remove(call.Caller); _active.Remove(call.Callee);
+            call.End(); CallCompleted?.Invoke(this, call); return true;
+        }
+        public bool AbortLast()
+        {
+            var call = _history.LastOrDefault(c => _active.ContainsKey(c.Caller));
+            return call != null && AbortCall(call);
+        }
+        public int AbortAll()
+        {
+            var calls = ActiveCalls.ToList();
+            foreach (var call in calls) AbortCall(call);
+            return calls.Count;
+        }
+        private void Fail(Handset from, Handset? to, string message) => CallFailed?.Invoke(this, new CallEventArgs(from, to, message));
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\Station\RegistrationService.cs
+==================================================
+using _13_variant.Phones;
+
+namespace PhoneStationModel
+{
+    public class RegistrationService
+    {
+        private readonly Dictionary<string, Handset> _byNumber = new();
+        private readonly List<Handset> _all = new();
+
+        public event EventHandler<Handset>? Registered;
+        public event EventHandler<Handset>? Unregistered;
+
+        public IReadOnlyList<Handset> All => _all.AsReadOnly();
+
+        public void Register(Handset h)
+        {
+            if (_byNumber.ContainsKey(h.Number)) throw new InvalidOperationException($"Номер {h.Number} занят.");
+            _byNumber[h.Number] = h;
+            _all.Add(h);
+            h.IsRegistered = true;
+            h.SetState(HandsetState.Idle);
+            Registered?.Invoke(this, h);
+        }
+
+        public void Unregister(Handset h)
+        {
+            if (!_byNumber.Remove(h.Number)) return;
+            _all.Remove(h);
+            h.IsRegistered = false;
+            h.SetState(HandsetState.Off);
+            Unregistered?.Invoke(this, h);
+        }
+
+        public Handset? Find(string number) => _byNumber.TryGetValue(number, out var h) ? h : null;
+        public bool IsRegistered(Handset h) => _byNumber.ContainsKey(h.Number);
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\UI\BufferedPanel.cs
+==================================================
+namespace PhoneStationModel
+{
+    public class BufferedPanel : Panel
+    {
+        public BufferedPanel()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw, true);
+            UpdateStyles();
+        }
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\UI\ModelManager.cs
+==================================================
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Linq;
+using _13_variant.Phones;
+
+namespace PhoneStationModel
+{
+    public sealed class AtcNode
+    {
+        public int Id { get; }
+        public PointF Position { get; set; }
+        public float VisibilityRadius { get; set; } = 300f;
+        public AtcNode(int id, PointF position) { Id = id; Position = position; }
+    }
+
+    public sealed class ModelManager
+    {
+        private sealed class DeviceInfo
+        {
+            public bool Permanent;
+            public double RemainingHours;
+            public float Vx, Vy;
+        }
+        private sealed class RouteReservation
+        {
+            public List<int> Stations = new();
+            public List<(int, int)> Links = new();
+        }
+
+        private readonly Random _rand = new();
+        private readonly Dictionary<Handset, DeviceInfo> _deviceInfo = new();
+        private readonly Dictionary<Call, RouteReservation> _reservations = new();
+        private readonly Dictionary<Call, List<int>> _callRoutes = new();
+        private readonly Dictionary<int, int> _stationLoads = new();
+        private readonly Dictionary<(int, int), int> _linkLoads = new();
+        private RectangleF _bounds = new(60, 60, 900, 500);
+        private int _nextNumber = 1000000;
+
+        public int StationCapacity { get; private set; } = 4;
+        public int LinkCapacity { get; private set; } = 2;
+        public BaseStation Station { get; } = new();
+        public List<Handset> Handsets { get; } = new();
+        public List<Signal> Signals { get; } = new();
+        public List<AtcNode> Atcs { get; } = new();
+        public bool NeedsRepaint { get; private set; } = true;
+        public event EventHandler<Handset>? HandsetAdded;
+        public event EventHandler<Handset>? HandsetRemoved;
+        public event EventHandler<string>? Log;
+        public int PermanentPhones { get; private set; }
+        public int PermanentHandsets { get; private set; }
+        public int TemporaryDevices => _deviceInfo.Count(kv => !kv.Value.Permanent);
+
+        public ModelManager()
+        {
+            Station.Router.CallCompleted += (_, call) => ReleaseRoute(call);
+            Station.Router.CallFailed += (_, args) => Log?.Invoke(this, args.Message);
+        }
+
+        public void Configure(int permanentPhones, int permanentHandsets, int stationCapacity, int linkCapacity, RectangleF bounds)
+        {
+            PermanentPhones = Math.Max(2, permanentPhones);
+            PermanentHandsets = Math.Max(2, permanentHandsets);
+            StationCapacity = Math.Max(1, stationCapacity);
+            LinkCapacity = Math.Max(1, linkCapacity);
+            _bounds = bounds;
+            Atcs.Clear();
+            // АТС сдвинуты ближе к центру; радиусы перекрываются и покрывают большую часть поля.
+            SetAtcGeometry(bounds);
+            _stationLoads.Clear(); _linkLoads.Clear();
+            for (int i = 0; i < 4; i++) _stationLoads[i] = 0;
+            for (int i = 0; i < 4; i++) _linkLoads[NormalizeLink(i, (i + 1) % 4)] = 0;
+            MarkDirty();
+        }
+
+        private void SetAtcGeometry(RectangleF bounds)
+        {
+            float xInset = bounds.Width * 0.24f;
+            float yInset = bounds.Height * 0.24f;
+            AtcNode[] nodes = Atcs.Count == 4 ? Atcs.ToArray() : Array.Empty<AtcNode>();
+            PointF[] positions =
+            {
+                new(bounds.Left + xInset, bounds.Top + yInset),
+                new(bounds.Right - xInset, bounds.Top + yInset),
+                new(bounds.Right - xInset, bounds.Bottom - yInset),
+                new(bounds.Left + xInset, bounds.Bottom - yInset)
+            };
+            if (nodes.Length == 0)
+            {
+                for (int i = 0; i < 4; i++) Atcs.Add(new AtcNode(i, positions[i]));
+                nodes = Atcs.ToArray();
+            }
+            float radius = Math.Max(100f, Math.Min(bounds.Width, bounds.Height) * 0.43f);
+            for (int i = 0; i < 4; i++)
+            {
+                nodes[i].Position = positions[i];
+                nodes[i].VisibilityRadius = radius;
+            }
+        }
+
+        public void InitializeDevices()
+        {
+            for (int i = 0; i < PermanentPhones; i++) AddDevice(isPhone: true, permanent: true);
+            for (int i = 0; i < PermanentHandsets; i++) AddDevice(isPhone: false, permanent: true);
+        }
+
+        public Handset AddTemporaryPhone() => AddDevice(true, false);
+        public Handset AddTemporaryHandset() => AddDevice(false, false);
+
+        private Handset AddDevice(bool isPhone, bool permanent)
+        {
+            var number = (++_nextNumber).ToString();
+            Handset device;
+            if (isPhone) device = new Phone(number, "Телефон");
+            else
+            {
+                var wired = new WiredHandset(number, "Абонент");
+                wired.LiftHook();
+                device = wired;
+            }
+
+            var p = FindSpawnPosition();
+            device.Position = p;
+            try
+            {
+                Station.Register(device);
+            }
+            catch (Exception ex)
+            {
+                Log?.Invoke(this, $"Не удалось зарегистрировать абонента: {ex.Message}");
+                return device;
+            }
+
+            _deviceInfo[device] = new DeviceInfo
+            {
+                Permanent = permanent,
+                RemainingHours = permanent ? double.PositiveInfinity : 6 + _rand.NextDouble() * 18,
+                Vx = (float)(_rand.NextDouble() * 4.0 - 2.0),
+                Vy = (float)(_rand.NextDouble() * 4.0 - 2.0)
+            };
+            Handsets.Add(device);
+            HandsetAdded?.Invoke(this, device);
+            Log?.Invoke(this, $"Добавлен {(permanent ? "постоянный" : "временный")} {(isPhone ? "телефон" : "трубка")} №{device.Number}" +
+                (permanent ? "." : $", срок жизни: {_deviceInfo[device].RemainingHours:F1} виртуальных ч."));
+            MarkDirty();
+            return device;
+        }
+
+        private PointF FindSpawnPosition()
+        {
+            for (int attempt = 0; attempt < 150; attempt++)
+            {
+                PointF p;
+                if (Atcs.Count == 4)
+                {
+                    var atc = Atcs[_rand.Next(Atcs.Count)];
+                    double angle = _rand.NextDouble() * Math.PI * 2;
+                    double radius = _rand.NextDouble() * Math.Max(30, atc.VisibilityRadius - 35);
+                    p = new PointF(atc.Position.X + (float)(Math.Cos(angle) * radius), atc.Position.Y + (float)(Math.Sin(angle) * radius));
+                    p = new PointF(Math.Clamp(p.X, _bounds.Left + 20, _bounds.Right - 20), Math.Clamp(p.Y, _bounds.Top + 20, _bounds.Bottom - 20));
+                }
+                else
+                {
+                    p = new PointF((float)(_bounds.Left + 25 + _rand.NextDouble() * Math.Max(1, _bounds.Width - 50)),
+                                   (float)(_bounds.Top + 25 + _rand.NextDouble() * Math.Max(1, _bounds.Height - 50)));
+                }
+                if (Handsets.All(h => Distance(h.Position, p) >= 38)) return p;
+            }
+            return new PointF(_bounds.Left + 30, _bounds.Top + 30);
+        }
+
+        public void UpdateBounds(RectangleF bounds)
+        {
+            _bounds = bounds;
+            if (Atcs.Count == 4) SetAtcGeometry(bounds);
+            MarkDirty();
+        }
+
+        public void Tick(double elapsedSeconds, double elapsedVirtualHours)
+        {
+            foreach (var h in Handsets.ToList())
+            {
+                if (!_deviceInfo.TryGetValue(h, out var info)) continue;
+                if (!info.Permanent)
+                {
+                    info.RemainingHours -= elapsedVirtualHours;
+                    if (info.RemainingHours <= 0)
+                    {
+                        RemoveDevice(h, "истёк срок жизни");
+                        continue;
+                    }
+                }
+
+                // Случайное блуждание: скорость слегка меняется на каждом тике.
+                info.Vx = Math.Clamp(info.Vx + (float)(_rand.NextDouble() - 0.5) * 0.75f, -2.8f, 2.8f);
+                info.Vy = Math.Clamp(info.Vy + (float)(_rand.NextDouble() - 0.5) * 0.75f, -2.8f, 2.8f);
+                h.Position = new PointF(h.Position.X + info.Vx * (float)(elapsedSeconds * 28),
+                                        h.Position.Y + info.Vy * (float)(elapsedSeconds * 28));
+                const float pad = 20f;
+                if (h.Position.X < _bounds.Left + pad || h.Position.X > _bounds.Right - pad)
+                {
+                    info.Vx = -info.Vx;
+                    h.Position = new PointF(Math.Clamp(h.Position.X, _bounds.Left + pad, _bounds.Right - pad), h.Position.Y);
+                }
+                if (h.Position.Y < _bounds.Top + pad || h.Position.Y > _bounds.Bottom - pad)
+                {
+                    info.Vy = -info.Vy;
+                    h.Position = new PointF(h.Position.X, Math.Clamp(h.Position.Y, _bounds.Top + pad, _bounds.Bottom - pad));
+                }
+            }
+
+            UpdateActiveRoutes();
+
+            for (int i = Signals.Count - 1; i >= 0; i--)
+            {
+                Signals[i].Progress += (float)(elapsedSeconds * 3.0);
+                if (Signals[i].Progress >= 1f)
+                {
+                    var signal = Signals[i];
+                    Signals.RemoveAt(i);
+                    signal.OnComplete?.Invoke();
+                }
+            }
+            MarkDirty();
+        }
+
+        private static Color GetCallColor(Call call)
+        {
+            return call.Caller is Phone && call.Callee is Phone ? Color.DodgerBlue : Color.IndianRed;
+        }
+
+        public bool MakeRandomCall()
+        {
+            var idle = Handsets.Where(h => h.IsRegistered && h.State == HandsetState.Idle && (h.CanMakeCall() || h is WiredHandset)).ToList();
+            if (idle.Count < 2) return false;
+            var from = idle[_rand.Next(idle.Count)];
+            var candidates = idle.Where(h => h != from).ToList();
+            // Сначала выбираем адресата, у которого есть маршрут через доступные АТС.
+            foreach (var to in candidates.OrderBy(_ => _rand.Next()))
+            {
+                var route = FindRoute(from.Position, to.Position);
+                if (route == null || !CanReserve(route)) continue;
+                if (from is WiredHandset wh && wh.Hook != HookState.OffHook) wh.LiftHook();
+                var call = Station.Call(from, to.Number);
+                if (call == null) continue;
+                Reserve(call, route);
+                _callRoutes[call] = route.ToList();
+                CreateCallSignals(call, route);
+                Log?.Invoke(this, $"Вызов: {from.Number} → {to.Number}; маршрут АТС {string.Join("–", route.Select(i => i + 1))}.");
+                MarkDirty();
+                return true;
+            }
+            Log?.Invoke(this, "Вызов не выполнен: нет свободного маршрута или абоненты вне зоны видимости АТС.");
+            return false;
+        }
+
+        private List<int>? FindRoute(PointF from, PointF to)
+        {
+            var starts = Atcs.Where(a => Distance(a.Position, from) <= a.VisibilityRadius).Select(a => a.Id).ToList();
+            var ends = Atcs.Where(a => Distance(a.Position, to) <= a.VisibilityRadius).Select(a => a.Id).ToList();
+            if (starts.Count == 0 || ends.Count == 0) return null;
+
+            var options = new List<List<int>>();
+            foreach (int a in starts)
+            foreach (int b in ends)
+            {
+                if (a == b) options.Add(new List<int> { a });
+                else
+                {
+                    var clockwise = new List<int> { a };
+                    for (int n = a, guard = 0; n != b && guard < 4; guard++) { n = (n + 1) % 4; clockwise.Add(n); }
+                    var counter = new List<int> { a };
+                    for (int n = a, guard = 0; n != b && guard < 4; guard++) { n = (n + 3) % 4; counter.Add(n); }
+                    options.Add(clockwise);
+                    options.Add(counter);
+                }
+            }
+            return options.DistinctBy(r => string.Join(",", r)).OrderBy(r => r.Count).FirstOrDefault(CanReserve);
+        }
+
+        private void UpdateActiveRoutes()
+        {
+            foreach (var call in Station.Router.ActiveCalls.ToList())
+            {
+                var oldRoute = _callRoutes.TryGetValue(call, out var old) ? old : null;
+                if (oldRoute != null && IsRouteStillUsable(call, oldRoute)) continue;
+
+                ReleaseReservationOnly(call);
+                var newRoute = FindRoute(call.Caller.Position, call.Callee.Position);
+                if (newRoute == null)
+                {
+                    Station.Router.AbortCall(call);
+                    Log?.Invoke(this, $"Звонок {call.Caller.Number} → {call.Callee.Number} прерван: абонент вне покрытия или нет свободного маршрута.");
+                    continue;
+                }
+                Reserve(call, newRoute);
+                _callRoutes[call] = newRoute.ToList();
+                if (!call.Connection.IsEstablished) CreateCallSignals(call, newRoute);
+                Log?.Invoke(this, $"Переключение маршрута звонка {call.Caller.Number} → {call.Callee.Number}: АТС {string.Join("–", newRoute.Select(i => i + 1))}.");
+            }
+        }
+
+        private bool IsRouteStillUsable(Call call, List<int> route)
+        {
+            return Distance(call.Caller.Position, Atcs[route[0]].Position) <= Atcs[route[0]].VisibilityRadius
+                && Distance(call.Callee.Position, Atcs[route[^1]].Position) <= Atcs[route[^1]].VisibilityRadius;
+        }
+
+        private void CreateCallSignals(Call call, List<int> route)
+        {
+            Signals.RemoveAll(s => s.RelatedCall == call);
+            var points = new List<PointF> { call.Caller.Position };
+            points.AddRange(route.Select(id => Atcs[id].Position));
+            points.Add(call.Callee.Position);
+            Color endpointColor = GetCallColor(call);
+            for (int segment = 0; segment < points.Count - 1; segment++)
+            {
+                PointF a = points[segment], b = points[segment + 1];
+                bool isAtcLink = segment > 0 && segment < points.Count - 2;
+                PointF mid = new((a.X + b.X) / 2f, (a.Y + b.Y) / 2f);
+                Signals.Add(new Signal
+                {
+                    From = a, Via = mid, To = b,
+                    Color = isAtcLink ? Color.LimeGreen : endpointColor,
+                    RelatedCall = call,
+                    OnComplete = segment == points.Count - 2 ? () => Station.Answer(call.Callee) : null
+                });
+            }
+        }
+
+        private bool CanReserve(List<int> route)
+        {
+            if (route.Any(id => _stationLoads[id] >= StationCapacity)) return false;
+            for (int i = 0; i < route.Count - 1; i++)
+                if (_linkLoads[NormalizeLink(route[i], route[i + 1])] >= LinkCapacity) return false;
+            return true;
+        }
+
+        private void Reserve(Call call, List<int> route)
+        {
+            var reservation = new RouteReservation { Stations = route.Distinct().ToList() };
+            for (int i = 0; i < route.Count - 1; i++) reservation.Links.Add(NormalizeLink(route[i], route[i + 1]));
+            foreach (int id in reservation.Stations) _stationLoads[id]++;
+            foreach (var link in reservation.Links) _linkLoads[link]++;
+            _reservations[call] = reservation;
+            _callRoutes[call] = route.ToList();
+        }
+
+        private void ReleaseReservationOnly(Call call)
+        {
+            if (!_reservations.Remove(call, out var r)) return;
+            foreach (int id in r.Stations) _stationLoads[id] = Math.Max(0, _stationLoads[id] - 1);
+            foreach (var link in r.Links) _linkLoads[link] = Math.Max(0, _linkLoads[link] - 1);
+            MarkDirty();
+        }
+
+        private void ReleaseRoute(Call call)
+        {
+            ReleaseReservationOnly(call);
+            _callRoutes.Remove(call);
+            Signals.RemoveAll(s => s.RelatedCall == call);
+            MarkDirty();
+        }
+
+        private static (int, int) NormalizeLink(int a, int b) => a < b ? (a, b) : (b, a);
+        private static float Distance(PointF a, PointF b) { float x = a.X - b.X, y = a.Y - b.Y; return (float)Math.Sqrt(x * x + y * y); }
+
+        private void RemoveDevice(Handset h, string reason)
+        {
+            var call = Station.Router.FindCallFor(h);
+            if (call != null) Station.Router.AbortCall(call);
+            Station.Unregister(h);
+            Handsets.Remove(h); _deviceInfo.Remove(h);
+            HandsetRemoved?.Invoke(this, h);
+            Log?.Invoke(this, $"Абонент №{h.Number} удалён: {reason}.");
+            MarkDirty();
+        }
+
+        public IEnumerable<Wire> GetWires()
+        {
+            // Физическая сеть — квадрат без диагоналей.
+            for (int i = 0; i < 4; i++)
+                yield return new Wire { From = Atcs[i].Position, To = Atcs[(i + 1) % 4].Position, Color = Color.SeaGreen, Thickness = 3f, Kind = WireKind.StationLink };
+
+            foreach (var call in Station.Router.ActiveCalls)
+            {
+                if (!_callRoutes.TryGetValue(call, out var route) || route.Count == 0) continue;
+                Color endpointColor = GetCallColor(call);
+                PointF previous = call.Caller.Position;
+                yield return new Wire { From = previous, To = Atcs[route[0]].Position, Color = endpointColor, Thickness = 2.5f, Kind = WireKind.CallRoute };
+                for (int i = 0; i < route.Count - 1; i++)
+                    yield return new Wire { From = Atcs[route[i]].Position, To = Atcs[route[i + 1]].Position, Color = Color.LimeGreen, Thickness = 3f, Kind = WireKind.CallRoute };
+                yield return new Wire { From = Atcs[route[^1]].Position, To = call.Callee.Position, Color = endpointColor, Thickness = 2.5f, Kind = WireKind.CallRoute };
+            }
+        }
+
+        public int GetStationLoad(int id) => _stationLoads.TryGetValue(id, out int n) ? n : 0;
+        public int GetLinkLoad(int a, int b) => _linkLoads.TryGetValue(NormalizeLink(a, b), out int n) ? n : 0;
+        public double? GetRemainingHours(Handset h) => _deviceInfo.TryGetValue(h, out var info) && !info.Permanent ? info.RemainingHours : null;
+        public bool IsPermanent(Handset h) => _deviceInfo.TryGetValue(h, out var info) && info.Permanent;
+        public void MarkDirty() => NeedsRepaint = true;
+        public void AfterRepaint() => NeedsRepaint = false;
+    }
+
+    public class Signal
+    {
+        public PointF From { get; set; }
+        public PointF Via { get; set; }
+        public PointF To { get; set; }
+        public float Progress { get; set; }
+        public Color Color { get; set; } = Color.DodgerBlue;
+        public Call? RelatedCall { get; set; }
+        public Action? OnComplete { get; set; }
+        public PointF CurrentPosition => Progress < 0.5f ? Lerp(From, Via, Progress * 2f) : Lerp(Via, To, (Progress - 0.5f) * 2f);
+        private static PointF Lerp(PointF a, PointF b, float t) => new(a.X + (b.X - a.X) * t, a.Y + (b.Y - a.Y) * t);
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\UI\SimulationEngine.cs
+==================================================
+namespace PhoneStationModel
+{
+    /// <summary>Управляет виртуальными часами и случайными попытками вызовов. Новые устройства автоматически не создаются.</summary>
+    public sealed class SimulationEngine
+    {
+        private readonly ModelManager _model;
+        private readonly Random _random = new();
+        private double _callAccumulator;
+        public SimulationClock Clock { get; } = new();
+        public bool Enabled { get; set; }
+        public double SpeedMultiplier { get; set; } = 1.0;
+        public double CallsPerVirtualHour { get; set; } = 5.5;
+        public event EventHandler? StatsChanged;
+        public int TotalCallsInitiated { get; private set; }
+        public SimulationEngine(ModelManager model) => _model = model;
+
+        public void Tick(int elapsedMs)
+        {
+            double virtualHours = elapsedMs / 1000.0 * Clock.MinutesPerSecond * SpeedMultiplier / 60.0;
+            Clock.Tick(elapsedMs, SpeedMultiplier);
+            _model.Tick(elapsedMs / 1000.0, virtualHours);
+            if (Enabled)
+            {
+                _callAccumulator += virtualHours * CallsPerVirtualHour * Clock.TimeFactor();
+                while (_callAccumulator >= 1.0)
+                {
+                    _callAccumulator -= 1.0;
+                    if (_model.MakeRandomCall()) TotalCallsInitiated++;
+                }
+            }
+            StatsChanged?.Invoke(this, EventArgs.Empty);
+        }
+        public void ResetStats() { TotalCallsInitiated = 0; StatsChanged?.Invoke(this, EventArgs.Empty); }
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\UI\SimulationForm.cs
+==================================================
+using _13_variant.Phones;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Windows.Forms;
+
+namespace PhoneStationModel
+{
+    public sealed class SimulationForm : Form
+    {
+        private readonly ModelManager _model = new();
+        private readonly SimulationEngine _engine;
+        private readonly System.Windows.Forms.Timer _timer = new() { Interval = 50 };
+        private BufferedPanel _field = null!;
+        private Button _autoButton = null!;
+        private Button _stopButton = null!;
+        private Label _status = null!;
+        private readonly Font _deviceFont = new("Consolas", 8, FontStyle.Bold);
+        private readonly Font _atcFont = new("Arial", 10, FontStyle.Bold);
+        private readonly Font _statusFont = new("Consolas", 9, FontStyle.Bold);
+
+        public SimulationForm(SimulationSettings settings)
+        {
+            Text = "Симуляция сети АТС";
+            StartPosition = FormStartPosition.CenterScreen;
+            Size = new Size(1200, 850);
+            MinimumSize = new Size(850, 650);
+            _engine = new SimulationEngine(_model);
+            _engine.Enabled = true; // Симуляция запускается сама, без нажатия кнопки.
+            BuildUi();
+            _model.Configure(settings.Phones, settings.Handsets, settings.AtcCapacity, settings.LinkCapacity, DrawBounds());
+            _model.InitializeDevices();
+            _model.Log += (_, message) => { _status.Text = message; };
+            _model.HandsetAdded += (_, _) => UpdateStatus();
+            _model.HandsetRemoved += (_, _) => UpdateStatus();
+            _engine.StatsChanged += (_, _) => UpdateStatus();
+            _field.Resize += (_, _) => { _model.UpdateBounds(DrawBounds()); _field.Invalidate(); };
+            _timer.Tick += (_, _) =>
+            {
+                _engine.Tick(_timer.Interval);
+                if (_model.NeedsRepaint) { _field.Invalidate(); _model.AfterRepaint(); }
+                UpdateStatus();
+            };
+            _timer.Start();
+            UpdateStatus();
+        }
+
+        private RectangleF DrawBounds() => new(25, 25, Math.Max(300, _field.Width - 50), Math.Max(300, _field.Height - 50));
+
+        private void BuildUi()
+        {
+            var toolbar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 52, Padding = new Padding(8), WrapContents = false, BackColor = Color.FromArgb(232, 235, 240) };
+            _autoButton = new Button { Text = "Продолжить звонки", Width = 165, Height = 34 };
+            _stopButton = new Button { Text = "Стоп", Width = 90, Height = 34, Enabled = false };
+            var addPhone = new Button { Text = "Добавить телефон", Width = 150, Height = 34 };
+            var addHandset = new Button { Text = "Добавить трубку", Width = 150, Height = 34 };
+            _autoButton.Text = "Продолжить звонки";
+            _autoButton.Enabled = false;
+            _stopButton.Enabled = true;
+            _autoButton.Click += (_, _) => { _engine.Enabled = true; _autoButton.Enabled = false; _stopButton.Enabled = true; _model.MarkDirty(); UpdateStatus(); };
+            _stopButton.Click += (_, _) => { _engine.Enabled = false; _autoButton.Enabled = true; _stopButton.Enabled = false; UpdateStatus(); };
+            addPhone.Click += (_, _) => _model.AddTemporaryPhone();
+            addHandset.Click += (_, _) => _model.AddTemporaryHandset();
+            toolbar.Controls.AddRange(new Control[] { _autoButton, _stopButton, addPhone, addHandset });
+
+            _field = new BufferedPanel { Dock = DockStyle.Fill, BackColor = Color.LightSkyBlue };
+            _field.Paint += DrawField;
+            _status = new Label { Dock = DockStyle.Bottom, Height = 28, Padding = new Padding(8, 0, 0, 0), TextAlign = ContentAlignment.MiddleLeft, Font = _statusFont, BackColor = Color.FromArgb(225, 228, 235) };
+            Controls.Add(_field); Controls.Add(_status); Controls.Add(toolbar);
+        }
+
+        private void DrawField(object? sender, PaintEventArgs e)
+        {
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            int hour = _engine.Clock.Hour;
+            Color sky = hour switch { >= 6 and < 9 => Color.FromArgb(255, 205, 155), >= 9 and < 18 => Color.LightSkyBlue, >= 18 and < 21 => Color.FromArgb(240, 150, 110), _ => Color.FromArgb(24, 30, 62) };
+            using (var b = new SolidBrush(sky)) g.FillRectangle(b, _field.ClientRectangle);
+            var bounds = DrawBounds();
+            using (var p = new Pen(Color.FromArgb(45, Color.Black)))
+            {
+                for (float x = bounds.Left; x <= bounds.Right; x += 50) g.DrawLine(p, x, bounds.Top, x, bounds.Bottom);
+                for (float y = bounds.Top; y <= bounds.Bottom; y += 50) g.DrawLine(p, bounds.Left, y, bounds.Right, y);
+            }
+
+            // Зелёные линии — только рёбра квадратной сети, никаких диагоналей.
+            foreach (var wire in _model.GetWires())
+            {
+                using var pen = new Pen(wire.Color, wire.Thickness);
+                g.DrawLine(pen, wire.From, wire.To);
+            }
+            for (int i = 0; i < _model.Atcs.Count; i++)
+            {
+                var a = _model.Atcs[i].Position;
+                var b = _model.Atcs[(i + 1) % _model.Atcs.Count].Position;
+                string load = $"{_model.GetLinkLoad(i, (i + 1) % 4)}/{_model.LinkCapacity}";
+                g.DrawString(load, _deviceFont, Brushes.DarkGreen, (a.X + b.X) / 2f, (a.Y + b.Y) / 2f);
+            }
+
+            foreach (var atc in _model.Atcs)
+            {
+                using var radiusPen = new Pen(Color.FromArgb(65, Color.DarkSlateGray), 1.5f) { DashStyle = DashStyle.Dash };
+                float r = atc.VisibilityRadius;
+                g.DrawEllipse(radiusPen, atc.Position.X - r, atc.Position.Y - r, r * 2, r * 2);
+                var rect = new RectangleF(atc.Position.X - 19, atc.Position.Y - 19, 38, 38);
+                g.FillRectangle(Brushes.DarkSlateGray, rect); g.DrawRectangle(Pens.Black, rect.X, rect.Y, rect.Width, rect.Height);
+                string label = $"АТС {atc.Id + 1}";
+                var size = g.MeasureString(label, _atcFont);
+                g.DrawString(label, _atcFont, Brushes.White, atc.Position.X - size.Width / 2, atc.Position.Y - 8);
+                string cap = $"{_model.GetStationLoad(atc.Id)}/{_model.StationCapacity}";
+                g.DrawString(cap, _deviceFont, Brushes.White, atc.Position.X - 15, atc.Position.Y + 22);
+            }
+
+            foreach (var h in _model.Handsets)
+            {
+                Color c = h.State switch { HandsetState.Idle => Color.LightGreen, HandsetState.Dialing => Color.Orange, HandsetState.Ringing => Color.Gold, HandsetState.Talking => Color.Tomato, _ => Color.LightGray };
+                using var brush = new SolidBrush(c);
+                const float size = 28;
+                if (h is Phone) g.FillEllipse(brush, h.Position.X - size / 2, h.Position.Y - size / 2, size, size);
+                else g.FillRectangle(brush, h.Position.X - size / 2, h.Position.Y - size / 2, size, size);
+                if (h is Phone) g.DrawEllipse(Pens.Black, h.Position.X - size / 2, h.Position.Y - size / 2, size, size);
+                else g.DrawRectangle(Pens.Black, h.Position.X - size / 2, h.Position.Y - size / 2, size, size);
+                g.DrawString(h.Number, _deviceFont, Brushes.Black, h.Position.X - 18, h.Position.Y + 17);
+                var remaining = _model.GetRemainingHours(h);
+                if (remaining.HasValue) g.DrawString($"{remaining.Value:F0}ч", _deviceFont, Brushes.DarkRed, h.Position.X - 12, h.Position.Y - 27);
+            }
+
+            foreach (var signal in _model.Signals)
+            {
+                var p = signal.CurrentPosition;
+                using var b = new SolidBrush(signal.Color);
+                g.FillEllipse(b, p.X - 5, p.Y - 5, 10, 10);
+            }
+
+            var time = _engine.Clock.TimeString;
+            using var timeFont = new Font("Consolas", 15, FontStyle.Bold);
+            using var timeBrush = new SolidBrush(hour >= 6 && hour < 20 ? Color.Black : Color.White);
+            g.DrawString(time, timeFont, timeBrush, _field.Width - 90, 12);
+        }
+
+        private void UpdateStatus()
+        {
+            if (_status == null || _status.IsDisposed) return;
+            _status.Text = $"Состояние: {(_engine.Enabled ? "автосимуляция" : "остановлена")} | Абонентов: {_model.Handsets.Count} | Временных: {_model.TemporaryDevices} | Активных вызовов: {_model.Station.Router.ActiveCalls.Count} | Вызовов запущено: {_engine.TotalCallsInitiated} | Виртуальное время: {_engine.Clock.TimeString}";
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) { _timer.Dispose(); _deviceFont.Dispose(); _atcFont.Dispose(); _statusFont.Dispose(); }
+            base.Dispose(disposing);
+        }
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\UI\StartupSettingsForm.cs
+==================================================
+using System.Drawing;
+using System.Windows.Forms;
+
+namespace PhoneStationModel
+{
+    public sealed class SimulationSettings
+    {
+        public int Phones { get; set; } = 2;
+        public int Handsets { get; set; } = 2;
+        public int AtcCapacity { get; set; } = 6;
+        public int LinkCapacity { get; set; } = 6;
+    }
+
+    public sealed class StartupSettingsForm : Form
+    {
+        private readonly NumericUpDown _phones = MakeNumber(4, 2, 100);
+        private readonly NumericUpDown _handsets = MakeNumber(4, 2, 100);
+        private readonly NumericUpDown _atcCapacity = MakeNumber(4, 1, 100);
+        private readonly NumericUpDown _linkCapacity = MakeNumber(2, 1, 100);
+        public SimulationSettings Settings { get; private set; } = new();
+
+        public StartupSettingsForm()
+        {
+            Text = "Настройки симуляции";
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterScreen;
+            MaximizeBox = false; MinimizeBox = false;
+            ClientSize = new Size(390, 240);
+
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(14), ColumnCount = 2, RowCount = 5 };
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 68));
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 32));
+            AddRow(layout, 0, "Постоянных телефонов (круглые):", _phones);
+            AddRow(layout, 1, "Постоянных трубок (квадратные):", _handsets);
+            AddRow(layout, 2, "Каналoв на одну АТС:", _atcCapacity);
+            AddRow(layout, 3, "Каналов на связь между АТС:", _linkCapacity);
+            var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft };
+            var start = new Button { Text = "Начать", DialogResult = DialogResult.OK, Width = 90 };
+            var cancel = new Button { Text = "Выход", DialogResult = DialogResult.Cancel, Width = 90 };
+            buttons.Controls.Add(start); buttons.Controls.Add(cancel);
+            layout.Controls.Add(buttons, 0, 4); layout.SetColumnSpan(buttons, 2);
+            Controls.Add(layout);
+            AcceptButton = start; CancelButton = cancel;
+            start.Click += (_, _) => Settings = new SimulationSettings
+            {
+                Phones = (int)_phones.Value, Handsets = (int)_handsets.Value,
+                AtcCapacity = (int)_atcCapacity.Value, LinkCapacity = (int)_linkCapacity.Value
+            };
+        }
+
+        private static NumericUpDown MakeNumber(int value, int min, int max) => new()
+        {
+            Minimum = min, Maximum = max, Value = value, Dock = DockStyle.Fill,
+            TextAlign = HorizontalAlignment.Center, ThousandsSeparator = false
+        };
+
+        private static void AddRow(TableLayoutPanel layout, int row, string text, Control control)
+        {
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            layout.Controls.Add(new Label { Text = text, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, row);
+            layout.Controls.Add(control, 1, row);
+        }
+    }
+}
+
+==================================================
+FILE: C:\Users\Netut\source\repos\13_variant\13_variant\UI\Wire.cs
+==================================================
+namespace PhoneStationModel
+{
+    public enum WireKind { StationLink, CallRoute, DirectTalk }
+
+    public class Wire
+    {
+        public PointF From { get; set; }
+        public PointF To { get; set; }
+        public Color Color { get; set; }
+        public float Thickness { get; set; } = 2f;
+        public WireKind Kind { get; set; }
+    }
+}
+
