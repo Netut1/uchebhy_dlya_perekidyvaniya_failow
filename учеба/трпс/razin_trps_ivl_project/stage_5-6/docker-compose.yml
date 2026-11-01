@@ -1,0 +1,10 @@
+name: razin_trps_ivl
+
+services:
+  ivl-api:
+    build: .
+    image: razin_trps_ivl_api:1.0
+    container_name: razin_trps_ivl_api
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
